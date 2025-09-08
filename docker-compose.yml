@@ -1,0 +1,33 @@
+
+version: "3.9"
+services:
+  telethon-sidecar:
+    build: .
+    container_name: telethon-sidecar
+    environment:
+      - API_ID=${API_ID}
+      - API_HASH=${API_HASH}
+      - SESSION_NAME=${SESSION_NAME:-f_session}
+      - SESSION_DIR=/data/session
+      - BOT_USERNAME=${BOT_USERNAME:-@a_bot}
+      - AUTH_TOKEN=${AUTH_TOKEN:-change-me}
+      - WAIT_AFTER_SEND=12
+    volumes:
+      - ./data/session:/data/session
+    ports:
+      - "8000:8000"
+
+  # Helper one-off container for first-time session initialization
+  telethon-sidecar-init:
+    image: python:3.11-slim
+    depends_on: []
+    working_dir: /app
+    environment:
+      - API_ID=${API_ID}
+      - API_HASH=${API_HASH}
+      - SESSION_NAME=${SESSION_NAME:-f_session}
+      - SESSION_DIR=/data/session
+    volumes:
+      - ./data/session:/data/session
+      - ./scripts:/app/scripts
+    entrypoint: ["python", "scripts/init_session.py"]
