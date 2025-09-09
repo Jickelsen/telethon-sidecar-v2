@@ -15,7 +15,7 @@ services:
     volumes:
       - ./data/session:/data/session
     ports:
-      - "8000:8000"
+      - "8733:8000"
 
   # Helper one-off container for first-time session initialization
   telethon-sidecar-init:
