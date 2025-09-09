@@ -30,4 +30,4 @@ services:
     volumes:
       - ./data/session:/data/session
       - ./scripts:/app/scripts
-    entrypoint: ["python", "scripts/init_session.py"]
+    entrypoint: ["bash", "-lc", "pip install telethon && python scripts/init_session.py"]
