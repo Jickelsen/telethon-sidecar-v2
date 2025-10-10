@@ -222,7 +222,7 @@ async def search_phone_via_bot(body: SearchViaBotBody):
     wait = body.wait_seconds or settings.wait_after_send
     phone = norm_phone(body.phone)
     text = body.message_template.format(phone=phone)
-    logger.info("search_phone_via_bot", extra={"bot": bot, "phone": phone, "message": text})
+    logger.info("search_phone_via_bot", extra={"bot": bot, "phone": phone, "msg_text": text})
     # Try to resolve phone (optional)
     try:
         await cl(ResolvePhoneRequest(phone=phone))
