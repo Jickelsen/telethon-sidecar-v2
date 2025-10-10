@@ -104,15 +104,22 @@ def norm_phone(p: str) -> str:
     return p
 
 def validate_bot_username(bot: str):
-    """Raise 400 if the bot username is invalid."""
+    """Normalize and validate a Telegram bot username."""
     if not bot:
         raise HTTPException(status_code=400, detail="Missing bot_username")
-    clean = bot.lstrip("@")
-    if not re.fullmatch(r"[a-zA-Z][\\w\\d]{3,30}[a-zA-Z\\d]", clean):
+
+    clean = bot.strip().lstrip("@")
+
+    # Telegram bot usernames must be 5–32 chars and end with 'bot' (case-insensitive)
+    if not (5 <= len(clean) <= 32 and clean.lower().endswith("bot")):
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid bot username '{bot}'. Must match [a-zA-Z][\\w\\d]{{3,30}}[a-zA-Z\\d].",
+            detail=(
+                f"Invalid bot username '{bot}'. "
+                "Telegram bot usernames must be 5–32 characters and end with 'bot'."
+            ),
         )
+
     return clean
 
 async def send_and_wait_reply(client, bot: str, text: str, timeout: int = 10):
