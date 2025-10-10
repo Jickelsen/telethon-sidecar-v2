@@ -104,7 +104,18 @@ async def resolve_phone(body: ResolvePhoneBody):
 @app.post("/bot/send", dependencies=[Depends(require_token)])
 async def bot_send(body: SendBotBody):
     cl = await get_client()
-    bot = body.bot_username or settings.bot_username
+
+    bot = (body.bot_username or settings.bot_username or "").strip()
+
+    # --- Validate username early ---
+    if not bot or not re.fullmatch(r"[a-zA-Z][\w\d]{3,30}[a-zA-Z\d]", bot.lstrip("@")):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid bot username '{bot}'. It must match [a-zA-Z][\\w\\d]{{3,30}}[a-zA-Z\\d]."
+        )
+
+    bot = bot.lstrip("@")
+
     wait = body.wait_seconds or settings.wait_after_send
 
     try:
@@ -122,7 +133,18 @@ async def bot_send(body: SendBotBody):
 @app.post("/search_phone_via_bot", dependencies=[Depends(require_token)])
 async def search_phone_via_bot(body: SearchViaBotBody):
     cl = await get_client()
-    bot = body.bot_username or settings.bot_username
+
+    bot = (body.bot_username or settings.bot_username or "").strip()
+
+    # --- Validate username early ---
+    if not bot or not re.fullmatch(r"[a-zA-Z][\w\d]{3,30}[a-zA-Z\d]", bot.lstrip("@")):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid bot username '{bot}'. It must match [a-zA-Z][\\w\\d]{{3,30}}[a-zA-Z\\d]."
+        )
+
+    bot = bot.lstrip("@")
+
     wait = body.wait_seconds or settings.wait_after_send
 
     # Try to resolve phone (best-effort)
