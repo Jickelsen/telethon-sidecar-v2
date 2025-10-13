@@ -42,7 +42,7 @@ async def require_token(authorization: Optional[str] = Header(None)):
 client: Optional[TelegramClient] = None
 
 async def get_client() -> TelegramClient:
-    """Get or initialize a connected TelegramClient."""
+    """Get or initialize a connected TelegramClient, reconnect if needed."""
     global client
     if client is None:
         os.makedirs(settings.session_dir, exist_ok=True)
@@ -56,13 +56,23 @@ async def get_client() -> TelegramClient:
             request_retries=5,
             timeout=settings.read_timeout,
         )
-        await client.connect()
-        if not await client.is_user_authorized():
-            raise HTTPException(
-                status_code=401,
-                detail="Session not authorized. Run init_session.py first.",
-            )
-        logger.info("Telethon client connected and authorized")
+
+    # Ensure connected
+    if not client.is_connected():
+        try:
+            await client.connect()
+            logger.info("Telethon client reconnected")
+        except Exception as e:
+            logger.exception(f"Failed to reconnect Telethon: {e}")
+            raise HTTPException(status_code=500, detail="Failed to reconnect Telegram client")
+
+    # Ensure authorized
+    if not await client.is_user_authorized():
+        raise HTTPException(
+            status_code=401,
+            detail="Session not authorized. Run init_session.py first.",
+        )
+
     return client
 
 @app.on_event("shutdown")
