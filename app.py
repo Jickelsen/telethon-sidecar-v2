@@ -233,6 +233,12 @@ async def search_phone_via_bot(body: SearchViaBotBody):
     phone = norm_phone(body.phone)
     text = body.message_template.format(phone=phone)
     logger.info("search_phone_via_bot", extra={"bot": bot, "phone": phone, "msg_text": text})
+    try:
+        entity = await client.get_entity(bot)
+    except Exception as e:
+        logger.error(f"Bot lookup failed for {bot}: {e}")
+        raise HTTPException(status_code=400, detail=f"Cannot resolve bot username '{bot}'. Make sure it exists.")
+    
     # Try to resolve phone (optional)
     try:
         await cl(ResolvePhoneRequest(phone=phone))
