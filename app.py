@@ -229,6 +229,8 @@ def validate_bot_username(bot: str) -> str:
         )
     return clean  # Telethon accepts without @
 
+from datetime import datetime, timezone
+
 async def send_and_collect_replies(
     client: TelegramClient,
     bot: str,
@@ -242,30 +244,60 @@ async def send_and_collect_replies(
       - no new messages arrive within `idle_timeout` seconds, OR
       - `overall_timeout` elapses, OR
       - `max_messages` collected.
+
     Returns: [{"text": "...", "date": "..."}]
     """
     messages: List[Dict[str, str]] = []
     queue: asyncio.Queue = asyncio.Queue()
 
-    # 1) Resolve entity FIRST (with your robust resolver)
-    entity = await resolve_bot_entity(client, bot)  # <-- this should raise 400/429/502 on failure
+    # 0) Make sure we're connected
+    if not client.is_connected():
+        await client.connect()
+        logger.info("Telethon client reconnected (send_and_collect_replies)")
 
-    # 2) Prepare an explicit event filter and handler, then register
-    event_filter = events.NewMessage(chats=entity)
+    # 1) Resolve the bot entity (raises 400/429/502 on failure)
+    entity = await resolve_bot_entity(client, bot)
+
+    # 2) Build a filter that only catches INCOMING messages in that dialog
+    event_filter = events.NewMessage(chats=entity, incoming=True)
+
+    # 3) Record a cutoff so we ignore stale messages from earlier runs
+    send_cutoff = datetime.now(timezone.utc)
 
     async def handler(event):
         try:
+            # Ignore anything older than when we sent our message
+            msg = event.message
+            if not msg:
+                return
+            if msg.date and msg.date.tzinfo is None:
+                # Telethon usually provides tz-aware datetimes, but be safe
+                msg_dt = msg.date.replace(tzinfo=timezone.utc)
+            else:
+                msg_dt = msg.date
+
+            if msg_dt and msg_dt < send_cutoff:
+                # Stale message from a previous run; ignore
+                return
+
             await queue.put(event)
         except Exception:
-            pass  # never crash the handler
+            # Never let the handler crash
+            pass
 
+    # 4) Register handler BEFORE sending
     client.add_event_handler(handler, event_filter)
 
-    # 3) Send the message
+    # 5) Send the message (retry once on transient disconnect)
     logger.info("Sending message", extra={"bot": bot, "msg_text": text})
-    await client.send_message(entity, text)
+    try:
+        await client.send_message(entity, text)
+    except ConnectionError:
+        await client.connect()
+        logger.info("Reconnect then resend", extra={"bot": bot})
+        await client.send_message(entity, text)
 
-    # 4) Collect until idle/overall/cap
+    # 6) Collect until idle/overall/cap
     loop = asyncio.get_event_loop()
     deadline = loop.time() + max(1, overall_timeout)
 
@@ -276,22 +308,30 @@ async def send_and_collect_replies(
                 break
 
             try:
-                event = await asyncio.wait_for(queue.get(), timeout=min(idle_timeout, remaining_overall))
-                msg_text = event.message.message if event and event.message else ""
-                msg_date = event.message.date.isoformat() if event and event.message and event.message.date else None
+                event = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=min(idle_timeout, remaining_overall),
+                )
+                msg = event.message
+                msg_text = msg.message if msg else ""
+                msg_date = (msg.date.astimezone(timezone.utc).isoformat()
+                            if msg and msg.date else None)
+
                 messages.append({"text": msg_text, "date": msg_date})
                 logger.info("Bot reply received", extra={"bot": bot, "count": len(messages)})
             except asyncio.TimeoutError:
-                logger.info("Idle period reached; stopping collection", extra={"bot": bot, "idle": idle_timeout})
+                logger.info("Idle period reached; stopping collection",
+                            extra={"bot": bot, "idle": idle_timeout})
                 break
     finally:
-        # 5) Always remove the exact same handler+filter
+        # 7) Always remove the exact same handler & filter
         try:
             client.remove_event_handler(handler, event_filter)
         except Exception:
             pass
 
     return messages
+
 
 # -----------------------------------------------------------------------------
 # Routes
