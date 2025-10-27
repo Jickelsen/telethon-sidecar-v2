@@ -9,6 +9,7 @@ class Settings(BaseModel):
     session_dir: str = os.getenv("SESSION_DIR", "/data/session")
     bot_username: str = os.getenv("BOT_USERNAME", "@a_bot")
     auth_token: str = os.getenv("AUTH_TOKEN", "change-me")
+    bot_user_id: int | None = int(os.getenv("BOT_USER_ID", "0")) or None
 
     # Timeouts (seconds)
     connect_timeout: int = int(os.getenv("CONNECT_TIMEOUT", "20"))

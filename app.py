@@ -10,6 +10,16 @@ from telethon import TelegramClient, events
 from telethon.errors.rpcerrorlist import FloodWaitError
 from telethon.tl.functions.contacts import ResolvePhoneRequest
 
+from telethon.errors.rpcerrorlist import (
+    FloodWaitError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
+)
+from telethon.errors import RpcCallFailError
+from telethon.tl.types import InputPeerUser
+import time
+
+
 from config import settings
 
 # -----------------------------------------------------------------------------
@@ -120,6 +130,77 @@ class SearchViaBotBody(BaseModel):
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+# In-memory cache for resolved bot entities
+_entity_cache: dict[str, object] = {}  # key: bot username (lowercased, no @) or "id:<id>"
+
+async def ensure_connected(client: TelegramClient):
+    if not client.is_connected():
+        await client.connect()
+        logger.info("Telethon client reconnected (ensure_connected)")
+
+async def resolve_bot_entity(client: TelegramClient, bot: str, *,
+                             retries: int = 3, backoff: float = 0.6):
+    """
+    Resolve bot to an InputPeer (cached), with reconnection + retry on transient errors.
+    Accepts either a username (w/ or w/o '@') or a numeric ID if BOT_USER_ID is set.
+    """
+    # Prefer BOT_USER_ID if configured
+    if settings.bot_user_id:
+        key = f"id:{settings.bot_user_id}"
+        if key in _entity_cache:
+            return _entity_cache[key]
+        await ensure_connected(client)
+        try:
+            ent = await client.get_entity(settings.bot_user_id)
+            _entity_cache[key] = ent
+            return ent
+        except Exception as e:
+            logger.warning("Failed to resolve BOT_USER_ID", extra={"error": str(e)})
+            # fall through to username resolution
+
+    clean = bot.strip().lstrip("@")
+    cache_key = clean.lower()
+    if cache_key in _entity_cache:
+        return _entity_cache[cache_key]
+
+    # retry loop for transient errors
+    delay = backoff
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        await ensure_connected(client)
+        try:
+            ent = await client.get_entity(clean)
+            _entity_cache[cache_key] = ent
+            return ent
+        except (UsernameInvalidError, UsernameNotOccupiedError) as e:
+            # This is a real "user doesn't exist / invalid username"
+            logger.error("Username invalid/not occupied", extra={"bot": clean, "error": str(e)})
+            raise HTTPException(status_code=400, detail=f"Username '{bot}' not found or invalid.")
+        except FloodWaitError as e:
+            logger.warning("Flood wait during get_entity", extra={"seconds": e.seconds})
+            raise HTTPException(status_code=429, detail=f"Flood wait: {e.seconds}s")
+        except (ConnectionError, TimeoutError, RpcCallFailError, asyncio.TimeoutError) as e:
+            # transient: reconnect + backoff
+            last_exc = e
+            logger.warning("Transient get_entity error; will retry",
+                           extra={"attempt": attempt, "error": str(e)})
+            try:
+                await client.connect()
+            except Exception:
+                pass
+            time.sleep(delay)
+            delay *= 2
+        except Exception as e:
+            last_exc = e
+            logger.exception("Unexpected error in get_entity", extra={"error": str(e)})
+            break
+
+    # If we exhausted retries, bubble up as 502 (bad gateway/upstream)
+    msg = f"Transient error resolving bot username '{bot}'. Please retry."
+    if last_exc:
+        msg += f" ({last_exc})"
+    raise HTTPException(status_code=502, detail=msg)
+
 PHONE_RE = re.compile(r"[^0-9+]")
 
 def norm_phone(p: str) -> str:
@@ -168,7 +249,7 @@ async def send_and_collect_replies(
     queue: asyncio.Queue = asyncio.Queue()
 
     # Event handler to push incoming bot messages into a queue
-    @client.on(events.NewMessage(chats=bot))
+    @client.on(events.NewMessage(chats=entity))
     async def handler(event):
         try:
             await queue.put(event)
@@ -178,7 +259,10 @@ async def send_and_collect_replies(
 
     # Resolve entity early for clear error if bot doesn't exist
     try:
-        _ = await client.get_entity(bot)
+        entity = await resolve_bot_entity(client, bot)
+        logger.info("Sending message", extra={"bot": bot, "msg_text": text})
+        await client.send_message(entity, text)
+
     except Exception as e:
         logger.error("Bot lookup failed", extra={"bot": bot, "error": str(e)})
         try:
