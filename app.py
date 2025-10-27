@@ -242,64 +242,52 @@ async def send_and_collect_replies(
       - no new messages arrive within `idle_timeout` seconds, OR
       - `overall_timeout` elapses, OR
       - `max_messages` collected.
-
     Returns: [{"text": "...", "date": "..."}]
     """
     messages: List[Dict[str, str]] = []
     queue: asyncio.Queue = asyncio.Queue()
 
-    # Event handler to push incoming bot messages into a queue
-    @client.on(events.NewMessage(chats=entity))
+    # 1) Resolve entity FIRST (with your robust resolver)
+    entity = await resolve_bot_entity(client, bot)  # <-- this should raise 400/429/502 on failure
+
+    # 2) Prepare an explicit event filter and handler, then register
+    event_filter = events.NewMessage(chats=entity)
+
     async def handler(event):
         try:
             await queue.put(event)
         except Exception:
-            # don't let handler crash
-            pass
+            pass  # never crash the handler
 
-    # Resolve entity early for clear error if bot doesn't exist
-    try:
-        entity = await resolve_bot_entity(client, bot)
-        logger.info("Sending message", extra={"bot": bot, "msg_text": text})
-        await client.send_message(entity, text)
+    client.add_event_handler(handler, event_filter)
 
-    except Exception as e:
-        logger.error("Bot lookup failed", extra={"bot": bot, "error": str(e)})
-        try:
-            client.remove_event_handler(handler, events.NewMessage(chats=bot))
-        except Exception:
-            pass
-        raise HTTPException(status_code=400, detail=f"Cannot resolve bot username '{bot}'. Make sure it exists.")
-
+    # 3) Send the message
     logger.info("Sending message", extra={"bot": bot, "msg_text": text})
-    await client.send_message(bot, text)
+    await client.send_message(entity, text)
 
+    # 4) Collect until idle/overall/cap
     loop = asyncio.get_event_loop()
     deadline = loop.time() + max(1, overall_timeout)
 
     try:
-        # Keep collecting until idle timeout or overall timeout or message cap
         while len(messages) < max_messages:
             remaining_overall = deadline - loop.time()
             if remaining_overall <= 0:
                 break
 
             try:
-                # Wait up to idle_timeout (but never beyond overall timeout)
                 event = await asyncio.wait_for(queue.get(), timeout=min(idle_timeout, remaining_overall))
                 msg_text = event.message.message if event and event.message else ""
                 msg_date = event.message.date.isoformat() if event and event.message and event.message.date else None
                 messages.append({"text": msg_text, "date": msg_date})
                 logger.info("Bot reply received", extra={"bot": bot, "count": len(messages)})
-                # After each message, loop again to see if more messages arrive within idle window
             except asyncio.TimeoutError:
-                # Quiet period hit: stop collecting
                 logger.info("Idle period reached; stopping collection", extra={"bot": bot, "idle": idle_timeout})
                 break
     finally:
-        # Always remove handler
+        # 5) Always remove the exact same handler+filter
         try:
-            client.remove_event_handler(handler, events.NewMessage(chats=bot))
+            client.remove_event_handler(handler, event_filter)
         except Exception:
             pass
 
