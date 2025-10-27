@@ -2,7 +2,7 @@ import asyncio
 import os
 import re
 import logging
-from typing import Optional
+from typing import Optional, List, Dict
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from pydantic import BaseModel
@@ -15,16 +15,14 @@ from config import settings
 # -----------------------------------------------------------------------------
 # Logging setup
 # -----------------------------------------------------------------------------
-LOG_FORMAT = (
-    "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-)
+LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger("telethon-sidecar")
 
 # -----------------------------------------------------------------------------
 # App init
 # -----------------------------------------------------------------------------
-app = FastAPI(title="Telethon Sidecar", version="1.2.0")
+app = FastAPI(title="Telethon Sidecar", version="1.3.0")
 
 # -----------------------------------------------------------------------------
 # Auth dependency
@@ -61,10 +59,10 @@ async def get_client() -> TelegramClient:
     if not client.is_connected():
         try:
             await client.connect()
-            logger.info("Telethon client reconnected")
+            logger.info("Telethon client connected/reconnected")
         except Exception as e:
-            logger.exception(f"Failed to reconnect Telethon: {e}")
-            raise HTTPException(status_code=500, detail="Failed to reconnect Telegram client")
+            logger.exception(f"Failed to connect Telethon: {e}")
+            raise HTTPException(status_code=500, detail="Failed to connect Telegram client")
 
     # Ensure authorized
     if not await client.is_user_authorized():
@@ -74,6 +72,20 @@ async def get_client() -> TelegramClient:
         )
 
     return client
+
+@app.on_event("startup")
+async def start_heartbeat():
+    async def heartbeat():
+        global client
+        while True:
+            await asyncio.sleep(300)  # every 5 minutes
+            if client and not client.is_connected():
+                try:
+                    await client.connect()
+                    logger.info("Reconnected in heartbeat")
+                except Exception as e:
+                    logger.warning(f"Heartbeat reconnect failed: {e}")
+    asyncio.create_task(heartbeat())
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -91,13 +103,19 @@ class ResolvePhoneBody(BaseModel):
 class SendBotBody(BaseModel):
     bot_username: Optional[str] = None
     text: str
-    wait_seconds: Optional[int] = None
+    # Collect-mode parameters
+    wait_seconds: Optional[int] = None       # overall timeout (total wall time)
+    idle_seconds: Optional[int] = None       # quiet period to stop after last msg
+    max_messages: Optional[int] = None       # safety cap
 
 class SearchViaBotBody(BaseModel):
     phone: str
     bot_username: Optional[str] = None
     message_template: str = "{phone}"
+    # Collect-mode parameters
     wait_seconds: Optional[int] = None
+    idle_seconds: Optional[int] = None
+    max_messages: Optional[int] = None
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -113,14 +131,13 @@ def norm_phone(p: str) -> str:
         return "+" + p
     return p
 
-def validate_bot_username(bot: str):
+def validate_bot_username(bot: str) -> str:
     """Normalize and validate a Telegram bot username."""
     if not bot:
         raise HTTPException(status_code=400, detail="Missing bot_username")
 
     clean = bot.strip().lstrip("@")
-
-    # Telegram bot usernames must be 5–32 chars and end with 'bot' (case-insensitive)
+    # Telegram bot usernames must be 5–32 chars and end with 'bot' (case-insensitive).
     if not (5 <= len(clean) <= 32 and clean.lower().endswith("bot")):
         raise HTTPException(
             status_code=400,
@@ -129,57 +146,90 @@ def validate_bot_username(bot: str):
                 "Telegram bot usernames must be 5–32 characters and end with 'bot'."
             ),
         )
+    return clean  # Telethon accepts without @
 
-    return clean
-
-async def send_and_wait_reply(client, bot: str, text: str, timeout: int = 10):
+async def send_and_collect_replies(
+    client: TelegramClient,
+    bot: str,
+    text: str,
+    overall_timeout: int = 20,
+    idle_timeout: int = 5,
+    max_messages: int = 20,
+) -> List[Dict[str, str]]:
     """
-    Send a message to a bot and wait for its next reply within timeout seconds.
-    Returns the reply text or None on timeout.
-    """
-    reply_text = None
-    waiter = asyncio.Event()
+    Send `text` to `bot` and collect all replies until:
+      - no new messages arrive within `idle_timeout` seconds, OR
+      - `overall_timeout` elapses, OR
+      - `max_messages` collected.
 
+    Returns: [{"text": "...", "date": "..."}]
+    """
+    messages: List[Dict[str, str]] = []
+    queue: asyncio.Queue = asyncio.Queue()
+
+    # Event handler to push incoming bot messages into a queue
     @client.on(events.NewMessage(chats=bot))
     async def handler(event):
-        nonlocal reply_text
-        reply_text = event.message.message
-        logger.info("Bot reply received", extra={"bot": bot, "reply": reply_text})
         try:
-            client.remove_event_handler(handler, events.NewMessage(chats=bot))
+            await queue.put(event)
         except Exception:
+            # don't let handler crash
             pass
-        waiter.set()
 
-    logger.info("Sending message", extra={"bot": bot, "text": text})
-    await client.send_message(bot, text)
+    # Resolve entity early for clear error if bot doesn't exist
     try:
-        await asyncio.wait_for(waiter.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        logger.warning("No reply within timeout", extra={"bot": bot, "timeout": timeout})
+        _ = await client.get_entity(bot)
+    except Exception as e:
+        logger.error("Bot lookup failed", extra={"bot": bot, "error": str(e)})
+        try:
+            client.remove_event_handler(handler, events.NewMessage(chats=bot))
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail=f"Cannot resolve bot username '{bot}'. Make sure it exists.")
+
+    logger.info("Sending message", extra={"bot": bot, "msg_text": text})
+    await client.send_message(bot, text)
+
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + max(1, overall_timeout)
+
+    try:
+        # Keep collecting until idle timeout or overall timeout or message cap
+        while len(messages) < max_messages:
+            remaining_overall = deadline - loop.time()
+            if remaining_overall <= 0:
+                break
+
+            try:
+                # Wait up to idle_timeout (but never beyond overall timeout)
+                event = await asyncio.wait_for(queue.get(), timeout=min(idle_timeout, remaining_overall))
+                msg_text = event.message.message if event and event.message else ""
+                msg_date = event.message.date.isoformat() if event and event.message and event.message.date else None
+                messages.append({"text": msg_text, "date": msg_date})
+                logger.info("Bot reply received", extra={"bot": bot, "count": len(messages)})
+                # After each message, loop again to see if more messages arrive within idle window
+            except asyncio.TimeoutError:
+                # Quiet period hit: stop collecting
+                logger.info("Idle period reached; stopping collection", extra={"bot": bot, "idle": idle_timeout})
+                break
     finally:
+        # Always remove handler
         try:
             client.remove_event_handler(handler, events.NewMessage(chats=bot))
         except Exception:
             pass
 
-    return reply_text
+    return messages
 
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    logger.info(
-        f"HTTP {request.method} {request.url.path}",
-        extra={"client": request.client.host}
-    )
+    logger.info(f"HTTP {request.method} {request.url.path}", extra={"client": request.client.host})
     try:
         response = await call_next(request)
-        logger.info(
-            f"{request.method} {request.url.path} -> {response.status_code}",
-            extra={"client": request.client.host}
-        )
+        logger.info(f"{request.method} {request.url.path} -> {response.status_code}", extra={"client": request.client.host})
         return response
     except Exception as e:
         logger.exception(f"Unhandled error on {request.url.path}: {e}")
@@ -214,13 +264,20 @@ async def resolve_phone(body: ResolvePhoneBody):
 async def bot_send(body: SendBotBody):
     cl = await get_client()
     bot = validate_bot_username(body.bot_username or settings.bot_username)
-    wait = body.wait_seconds or settings.wait_after_send
+
+    overall = body.wait_seconds if body.wait_seconds is not None else settings.wait_after_send
+    idle = body.idle_seconds if body.idle_seconds is not None else 5
+    cap = body.max_messages if body.max_messages is not None else 20
+
     try:
-        reply_text = await send_and_wait_reply(cl, bot, body.text, wait)
-        return {"sent": True, "reply": reply_text}
+        msgs = await send_and_collect_replies(cl, bot, body.text, overall_timeout=overall, idle_timeout=idle, max_messages=cap)
+        reply = msgs[-1]["text"] if msgs else None
+        return {"sent": True, "messages": msgs, "reply": reply}
     except FloodWaitError as e:
         logger.warning("Flood wait", extra={"seconds": e.seconds})
         raise HTTPException(status_code=429, detail=f"Flood wait: {e.seconds}s")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Error in /bot/send", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
@@ -229,33 +286,35 @@ async def bot_send(body: SendBotBody):
 async def search_phone_via_bot(body: SearchViaBotBody):
     cl = await get_client()
     bot = validate_bot_username(body.bot_username or settings.bot_username)
-    wait = body.wait_seconds or settings.wait_after_send
+
+    overall = body.wait_seconds if body.wait_seconds is not None else settings.wait_after_send
+    idle = body.idle_seconds if body.idle_seconds is not None else 5
+    cap = body.max_messages if body.max_messages is not None else 20
+
     phone = norm_phone(body.phone)
     text = body.message_template.format(phone=phone)
+
     logger.info("search_phone_via_bot", extra={"bot": bot, "phone": phone, "msg_text": text})
-    try:
-        entity = await client.get_entity(bot)
-    except Exception as e:
-        logger.error(f"Bot lookup failed for {bot}: {e}")
-        raise HTTPException(status_code=400, detail=f"Cannot resolve bot username '{bot}'. Make sure it exists.")
-    
-    # Try to resolve phone (optional)
+
+    # Optional: best-effort phone resolve to warm caches (ignore errors)
     try:
         await cl(ResolvePhoneRequest(phone=phone))
     except Exception:
         pass
 
     try:
-        reply_text = await send_and_wait_reply(cl, bot, text, wait)
-        logger.info("Bot interaction complete", extra={"bot": bot, "reply": reply_text})
-        return {"ok": True, "query": text, "reply": reply_text}
+        msgs = await send_and_collect_replies(cl, bot, text, overall_timeout=overall, idle_timeout=idle, max_messages=cap)
+        reply = msgs[-1]["text"] if msgs else None
+        logger.info("Bot interaction complete", extra={"bot": bot, "collected": len(msgs)})
+        return {"ok": True, "query": text, "messages": msgs, "reply": reply}
     except asyncio.TimeoutError:
-        logger.warning("Timeout waiting for bot reply", extra={"bot": bot, "timeout": wait})
-        return {"ok": False, "query": text, "reply": None, "error": "timeout"}
+        logger.warning("Timeout waiting for bot reply", extra={"bot": bot, "overall": overall})
+        return {"ok": False, "query": text, "messages": [], "reply": None, "error": "timeout"}
     except FloodWaitError as e:
         logger.warning("Flood wait", extra={"seconds": e.seconds})
         raise HTTPException(status_code=429, detail=f"Flood wait: {e.seconds}s")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Error in /search_phone_via_bot", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
-
